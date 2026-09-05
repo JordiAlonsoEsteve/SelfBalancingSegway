@@ -1,0 +1,4 @@
+[ ] Clean main function (be careful and add functionality for logging and also for 
+SysID, PID and LQR. Ensuring everything works and I can easily configure one thing or the other)
+[ ] Making the LQR work is difficult!
+[ ] You need to have a comfortable interface for sysID

@@ -24,7 +24,7 @@ static int computeLinearizedPWM(float cmdFraction, int minPWM, float trim) {
 // Low-level independent control: Accepts UNBOUNDED raw left/right commands
 void setMotorOutputs(float leftCmd, float rightCmd) {
   
-  // Normalize the unbounded math inputs into a fraction (e.g., 120.0 / 100.0 = 1.2)
+  // Normalize the unbounded math inputs into a fraction
   // capped at 100% since it will saturate the PWM and breakdown.
   float leftFraction = min(leftCmd / config.u_max, 1.0f);
   float rightFraction = min(rightCmd / config.u_max, 1.0f);
