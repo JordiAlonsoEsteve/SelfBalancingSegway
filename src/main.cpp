@@ -1,123 +1,68 @@
 #include <Wire.h>
 #include <Arduino.h>
 #include "kalman.h"
-//#include "complementary_filter.h"
 #include "BluetoothSerial.h"
 #include "wheelControl.h"
 #include "bmi160_driver.h"
 #include "encoder_driver.h"
-# include "PID.h"
-//# include "LQR.h"
-
-
-// LQR stuff
-//LQR lqrController;
-//float u_left = 0.0f;
-//float u_right = 0.0f;
-
-constexpr float TICK_IN_CM = 0.0136f;
-constexpr float TICK_TO_METERS = TICK_IN_CM / 100.0f; // 0.000136 meters per tick
-constexpr float DEG_TO_RAD_FACTOR = PI / 180.0f;
-
-// Structure to hold standard SI units (Meters, Radians, Seconds)
-struct PhysicalState {
-    float angle_rad;
-    float rate_rad_s;
-    float pos_left_m;
-    float speed_left_m_s;
-    float pos_right_m;
-    float speed_right_m_s;
-    float avg_pos_m;
-    float avg_speed_m_s;
-    float u_left_normalized;  // Optional: -1.0 to 1.0 instead of -255 to 255
-    float u_right_normalized;
-};
-
-// Conversion function
-PhysicalState convertToSensibleUnits(float angle_deg, float rate_dps, 
-                                     int32_t pos_left_ticks, int16_t speed_left_tps, 
-                                     int32_t pos_right_ticks, int16_t speed_right_tps,
-                                     float u_left_pwm, float u_right_pwm) {
-    PhysicalState state;
-    
-    // Degrees -> Radians
-    state.angle_rad = angle_deg * DEG_TO_RAD_FACTOR;
-    state.rate_rad_s = rate_dps * DEG_TO_RAD_FACTOR;
-    
-    // Ticks -> Meters (Standard SI is strongly preferred over cm for state-space math)
-    state.pos_left_m = static_cast<float>(pos_left_ticks) * TICK_TO_METERS;
-    state.speed_left_m_s = static_cast<float>(speed_left_tps) * TICK_TO_METERS;
-    
-    state.pos_right_m = static_cast<float>(pos_right_ticks) * TICK_TO_METERS;
-    state.speed_right_m_s = static_cast<float>(speed_right_tps) * TICK_TO_METERS;
-    
-    // Convenience averages for the robot center
-    state.avg_pos_m = (state.pos_left_m + state.pos_right_m) / 2.0f;
-    state.avg_speed_m_s = (state.speed_left_m_s + state.speed_right_m_s) / 2.0f;
-
-    // Map PWM to a percentage [-1.0, 1.0]. 
-    // Multiply this by max battery voltage if you want actual Volts for matrix B.
-    state.u_left_normalized = u_left_pwm / 255.0f;
-    state.u_right_normalized = u_right_pwm / 255.0f;
-    
-    return state;
-}
-
-// ==========================================================
-// SYSTEM IDENTIFICATION PARAMETERS
-// ==========================================================
-bool enableSysId = true;         // Toggle noise injection
-float noiseAmplitude = 35.0f;    // Max PWM noise amplitude 
-int noiseHoldCycles = 5;         // Hold noise for 5 cycles (12.5ms at 400Hz)
-int noiseCounter = 0;
-float currentNoiseLeft = 0.0f;
-float currentNoiseRight = 0.0f;
-
-// ==========================================================
-// CONTROL LOOP TIMING
-// ==========================================================
-constexpr uint32_t CONTROL_PERIOD_US = 2500; // 2.5 ms in microseconds (400 Hz)
-constexpr float CONTROL_DT = CONTROL_PERIOD_US / 1000000.0f; // 2.5 ms in seconds
-
-uint32_t nextControlTime = 0;
-
-
+#include "PID.h"
+#include "LQR.h"
 // Check if Bluetooth is enabled in the ESP32 core
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
 #endif
 
+
+// ==========================================================
+// CONSTANTS
+// ==========================================================
+constexpr float TICK_IN_CM = 15/1040.0f; // 15cm per 1040 ticks
+constexpr float TICK_TO_METERS = TICK_IN_CM / 100.0f; // 0.000136 meters per tick
+constexpr float DEG_TO_RAD_FACTOR = PI / 180.0f;
+constexpr uint32_t CONTROL_PERIOD_US = 2500; // ~285Hz control loop
+constexpr float CONTROL_DT = CONTROL_PERIOD_US / 1000000.0f; 
 const int bmi160_addr = 0x68;
 const int sda_pin     = 21;     // ESP32 Hardware Default SDA
 const int scl_pin     = 22;     // ESP32 Hardware Default SCL
-BMI160Driver bmi160(bmi160_addr);
-BMI160Data imuData;
-
-// ==========================================================
-// TUNING VARIABLES
-// ==========================================================
 // Balance Loop Tunings
-float balKp = 12;
-float balKi = 0;
-float balKd = 0.4;
-PID balancePID(balKp, balKi, balKd, -255.0, 255.0);
-
+const float balKp = 9.5 / DEG_TO_RAD_FACTOR;
+const float balKi = 0.0;
+const float balKd = 0.45 / DEG_TO_RAD_FACTOR;
 // Position Loop Tunings
-// Limit output to +/- 10 degrees so the robot doesn't try to faceplant 
-// when pushed hard.
-float posKp = 0.0006;
-float posKi = 0.0;
-float posKd = 0.01;
-PID positionPID(posKp, posKi, posKd, -2.0, 2.0);
-
-float MECHANICAL_ZERO = -1.4;
-
-String inputBuffer = "";
-unsigned long lastTime = 0;
-
+// Position Loop Tunings (Outputs radians instead of degrees)
+const float posKp = (0.0001 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
+const float posKi = 0.0;
+const float posKd = (0.05 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
+// Correcting robot's balance
+const float MECHANICAL_ZERO = -1.4;
+// SYSID stuff
+const bool enableSysId = false;         // Toggle noise injection
+const float noiseAmplitude = 20.0f;    // Max noise amplitude; 100 is 100% ! 
+const int noiseHoldCycles = 15;         // Hold noise for 5 cycles (12.5ms at 400Hz)
 // ==========================================================
-// MULTI-CORE TELEMETRY SETUP
+// DATA STRUCTURES
 // ==========================================================
+
+// Structure to hold standard SI units (Meters, Radians, Seconds)
+struct IMUstate {
+    float angle_rad;
+    float target_angle_rad;
+    float rate_rad_s;
+};
+  
+struct EncoderState {
+    float pos_left_m;
+    float speed_left_m_s;
+    float pos_right_m;
+    float speed_right_m_s;
+};
+
+
+struct SystemInput
+{
+    float u_left_normalized;
+    float u_right_normalized;
+};
 
 // Structure to hold all data needed for printing/transmitting
 struct TelemetryPacket {
@@ -134,16 +79,15 @@ struct TelemetryPacket {
   float u_left;
   float u_right;
   float time_taken;
-  uint32_t current_time;
-};
+  uint32_t current_time;};
 
-// FreeRTOS Queue Handle
-QueueHandle_t telemetryQueue;
-BluetoothSerial SerialBT;
+BMI160Data imuData;
 
-// Compact 20-byte struct strictly for System ID over Bluetooth
+// Compact struct strictly for System ID over Bluetooth
 struct __attribute__((packed)) SystemIdWirePacket {
+  uint16_t header = 0xABCD; // Magic marker to prevent desync
   float   filtered_angle;
+  float   target_angle;
   float   filtered_rate;
   float enc_pos1;
   float enc_speed1;
@@ -151,13 +95,63 @@ struct __attribute__((packed)) SystemIdWirePacket {
   float enc_speed2;
   float   u_left;
   float   u_right;
+  float   time_taken;
   uint32_t current_time;
 };
 
 // ==========================================================
-// CORE 0: BATCHING TELEMETRY TASK
+// GLOBAL OBJECTS
 // ==========================================================
-void telemetryTask(void *pvParameters) {
+BMI160Driver bmi160(bmi160_addr);
+PID balancePID(balKp, balKi, balKd, -255.0, 255.0);
+PID positionPID(posKp, posKi, posKd, -3.0 * DEG_TO_RAD_FACTOR, 3.0 * DEG_TO_RAD_FACTOR);// FreeRTOS Queue Handle
+QueueHandle_t telemetryQueue;
+BluetoothSerial SerialBT;
+LQR lqrController;
+
+
+// ==========================================================
+// UTILITY FUNCTIONS
+// ==========================================================
+// Conversion function for IMU data (Degrees -> Radians)
+IMUstate convertIMUtoSensibleUnits(float angle_deg, float target_angle, float rate_dps) {
+    IMUstate state;
+    
+    // Degrees -> Radians
+    state.angle_rad = angle_deg * DEG_TO_RAD_FACTOR;
+    state.target_angle_rad = target_angle * DEG_TO_RAD_FACTOR;
+    state.rate_rad_s = rate_dps * DEG_TO_RAD_FACTOR;
+    
+    return state;
+}
+
+// Conversion function for Encoder data (Ticks -> Meters)
+EncoderState convertEncoderToSensibleUnits(int32_t pos_left_ticks, int16_t speed_left_tps, 
+                                           int32_t pos_right_ticks, int16_t speed_right_tps) {
+    EncoderState state;
+    
+    // Ticks -> Meters
+    state.pos_left_m = static_cast<float>(pos_left_ticks) * TICK_TO_METERS;
+    state.speed_left_m_s = static_cast<float>(speed_left_tps) * TICK_TO_METERS;
+
+    state.pos_right_m = static_cast<float>(pos_right_ticks) * TICK_TO_METERS;
+    state.speed_right_m_s = static_cast<float>(speed_right_tps) * TICK_TO_METERS;
+    
+    return state;
+}
+
+// Conversion function for System Input (PWM -> Normalized)
+SystemInput convertSystemInputToSensibleUnits(int16_t u_left_pwm, int16_t u_right_pwm) {
+    SystemInput state;
+    
+    // Normalized PWM for matrix B scaling
+    state.u_left_normalized = static_cast<float>(u_left_pwm) / 255.0f;
+    state.u_right_normalized = static_cast<float>(u_right_pwm) / 255.0f;
+    
+    return state;
+}
+
+void Batched_telemetryTask(void *pvParameters) {
   TelemetryPacket packet;
 
   // Batch 40 packets (100ms of data at 400Hz)
@@ -173,7 +167,9 @@ void telemetryTask(void *pvParameters) {
       }
 
       // Pack only the essential variables into the buffer
+      wireBuffer[bufferIndex].header         = 0xABCD;
       wireBuffer[bufferIndex].filtered_angle = packet.filtered_angle;
+      wireBuffer[bufferIndex].target_angle   = packet.target_angle;
       wireBuffer[bufferIndex].filtered_rate  = packet.filtered_rate;
       wireBuffer[bufferIndex].enc_pos1       = packet.enc_pos1;
       wireBuffer[bufferIndex].enc_speed1     = packet.enc_speed1;
@@ -181,6 +177,7 @@ void telemetryTask(void *pvParameters) {
       wireBuffer[bufferIndex].enc_speed2     = packet.enc_speed2;
       wireBuffer[bufferIndex].u_left         = packet.u_left;
       wireBuffer[bufferIndex].u_right        = packet.u_right;
+      wireBuffer[bufferIndex].time_taken     = packet.time_taken;
       wireBuffer[bufferIndex].current_time   = packet.current_time;
       
       bufferIndex++;
@@ -197,51 +194,53 @@ void telemetryTask(void *pvParameters) {
   }
 }
 
-//void processCommand(String cmd) {
-//  cmd.trim(); 
-//  if (cmd.length() < 2) return;
-//  
-//  char type = cmd.charAt(0);
-//  float val = cmd.substring(1).toFloat();
-//  bool balChanged = false;
-//  bool posChanged = false;
-//
-//  // Uppercase for BALANCE loop
-//  if      (type == 'P') { balKp = val; balChanged = true; }
-//  else if (type == 'I') { balKi = val; balChanged = true; }
-//  else if (type == 'D') { balKd = val; balChanged = true; }
-//  // Lowercase for POSITION loop
-//  else if (type == 'p') { posKp = val; posChanged = true; }
-//  else if (type == 'i') { posKi = val; posChanged = true; }
-//  else if (type == 'd') { posKd = val; posChanged = true; }
-//  else if (type == 'Z') { MECHANICAL_ZERO = val; Serial.printf(">>> MECHANICAL ZERO SET TO: %.2f <<<\n", MECHANICAL_ZERO); SerialBT.printf(">>> MECHANICAL ZERO SET TO: %.2f <<<\n", MECHANICAL_ZERO); }
-//  else { Serial.printf("Unknown command: %s\n", cmd.c_str()); SerialBT.printf("Unknown command: %s\n", cmd.c_str()); return; }
-//
-//  if (balChanged) {
-//    balancePID.setTunings(balKp, balKi, balKd);
-//    Serial.printf("\n>>> BALANCE TUNED: P:%.2f I:%.2f D:%.2f <<<\n\n", balKp, balKi, balKd);
-//    SerialBT.printf("\n>>> BALANCE TUNED: P:%.2f I:%.2f D:%.2f <<<\n\n", balKp, balKi, balKd);
-//  }
-//  
-//  if (posChanged) {
-//    positionPID.setTunings(posKp, posKi, posKd);
-//    Serial.printf("\n>>> POSITION TUNED: p:%.4f i:%.4f d:%.4f <<<\n\n", posKp, posKi, posKd);
-//    SerialBT.printf("\n>>> POSITION TUNED: p:%.4f i:%.4f d:%.4f <<<\n\n", posKp, posKi, posKd);
-//  }
-//}
+void Serial_telemetryTask(void *pvParameters) {
+  static int counter = 0;
+  TelemetryPacket packet;
 
-//void checkTuning() {
-//  //while (Serial.available()) {
-//  //  char c = Serial.read();
-//  //  if (c == '\n') { processCommand(inputBuffer); inputBuffer = ""; } 
-//  //  else { inputBuffer += c; }
-//  //}
-//  while (SerialBT.available()) {
-//    char c = SerialBT.read();
-//    if (c == '\n') { processCommand(inputBuffer); inputBuffer = ""; } 
-//    else { inputBuffer += c; }
-//  }
-//}
+  for (;;) {
+    // Wait for a new packet from Core 1
+    if (xQueueReceive(telemetryQueue, &packet, portMAX_DELAY) == pdPASS) {
+      if (!packet.imuSuccess) {
+        continue; // Skip failed IMU reads
+      }
+
+      if (++counter >= 10) { // Print every 10th packet
+        counter = 0;
+
+        // Print the telemetry data to Bluetooth
+        SerialBT.printf(
+          "Angle: %.2f rad, Target: %.2f rad, Rate: %.2f rad/s | Left: %.2f m, %.2f m/s | Right: %.2f m, %.2f m/s | u: %.2f, %.2f | Time taken: %.3f ms\n",
+          packet.filtered_angle,
+          packet.target_angle,
+          packet.filtered_rate,
+          packet.enc_pos1,
+          packet.enc_speed1,
+          packet.enc_pos2,
+          packet.enc_speed2,
+          packet.u_left,
+          packet.u_right,
+          packet.time_taken
+        );
+      }
+    }
+  }
+}
+
+// ==========================================================
+// VARIABLES
+// ==========================================================
+int noiseCounter = 0;
+float currentNoiseLeft = 0.0f;
+float currentNoiseRight = 0.0f;
+uint32_t nextControlTime = 0;
+String inputBuffer = "";
+unsigned long lastTime = 0;
+int32_t pwmLeft = 0;
+int32_t pwmRight = 0;
+float telemetryPwmLeft = 0.0f;
+float telemetryPwmRight = 0.0f;
+
 
 // ==========================================================
 void setup() {
@@ -263,7 +262,7 @@ void setup() {
   telemetryQueue = xQueueCreate(10, sizeof(TelemetryPacket));
 
   xTaskCreatePinnedToCore(
-    telemetryTask, "TelemetryTask", 4096, NULL, 1, NULL, 0
+    Batched_telemetryTask, "TelemetryTask", 4096, NULL, 1, NULL, 0
   );
 
   pinMode(PIN_AIN1, OUTPUT); pinMode(PIN_AIN2, OUTPUT);
@@ -280,30 +279,16 @@ void setup() {
 }
 
 void loop() {
-  // Handle tuning commands whenever they arrive.
-  //checkTuning();
-
   uint32_t now = micros();
-
   // Not time for the next control iteration yet.
   if ((int32_t)(now - nextControlTime) < 0) {
-    //SerialBT.printf("Waiting for next control iteration. Time left: %.3f ms\n", (nextControlTime - now) / 1000.0);
     return;
-  }
-
-  // Are we running late?
-  if ((int32_t)(now - nextControlTime) > CONTROL_PERIOD_US) {
-    //SerialBT.printf("Warning: Control loop is running late! by %.3f ms\n", (now - nextControlTime) / 1000.0);
-    nextControlTime = now; // Reset the next control time to now to avoid accumulating delay
   }
   // Schedule the next iteration.
   nextControlTime += CONTROL_PERIOD_US;
-
-  
   // ========================================================
   // IMU DATA
   // ========================================================
-
   float &raw_gx = imuData.gx_dps;
   float &raw_gy = imuData.gy_dps;
   float &raw_gz = imuData.gz_dps;
@@ -314,16 +299,16 @@ void loop() {
 
   float filtered_angle = 0.0f;
   float filtered_rate = 0.0f;
-  float smoothed_rate = 0.0f;
+  float _ = 0.0f;
 
   // ========================================================
-  // 1. READ IMU + ENCODERS
+  // READ RAW IMU + RAW ENCODERS
   // ========================================================
   bool imuSuccess = bmi160.readSensor(imuData);
   EncoderData encData = getEncoderData();
 
   // ========================================================
-  // 2. KALMAN FILTER
+  // KALMAN FILTER
   // ========================================================
   updateKalman(
     raw_ay,
@@ -332,17 +317,30 @@ void loop() {
     CONTROL_DT,
     filtered_angle, 
     filtered_rate,
-    smoothed_rate
+    _
   );
+  // Get the proper scale for the Kalman filter output (radians)
+  IMUstate imuState = convertIMUtoSensibleUnits(
+    filtered_angle,
+    MECHANICAL_ZERO,
+    filtered_rate);
+
+  // get the proper scale for the encoder output (meters)
+  EncoderState encoderState = convertEncoderToSensibleUnits(
+    encData.pos1,
+    encData.speed1,
+    encData.pos2,
+    encData.speed2);
 
   // ========================================================
-  // 4. POSITION LOOP
+  // POSITION PID
   // ========================================================
   float avg_pos =
-    (encData.pos1 + encData.pos2) / 2.0f;
+    (encoderState.pos_left_m + encoderState.pos_right_m) / 2.0f;
+  avg_pos = constrain(avg_pos, -5000.0f, 5000.0f);
 
   float avg_speed =
-    (encData.speed1 + encData.speed2) / 2.0f;
+    (encoderState.speed_left_m_s + encoderState.speed_right_m_s) / 2.0f;
   float angle_adjustment = // Modifies the angle to force a deviation to
     // correct the position error. This is the outer loop of the cascaded PID.
     positionPID.compute(
@@ -353,115 +351,106 @@ void loop() {
       false
 
     );
+  
+  float dynamic_target_angle = imuState.target_angle_rad + angle_adjustment;
 
   // ========================================================
-  // 5. BALANCE LOOP
+  // BALANCE PID
   // ========================================================
-  float dynamic_target_angle =
-  MECHANICAL_ZERO + angle_adjustment;
-
+  
   float u =
     balancePID.compute(
-      dynamic_target_angle,
-      filtered_angle, // Current angle from Kalman filter
-      smoothed_rate, // angular speed in degrees/sec from Kalman filter
+      dynamic_target_angle, // Target angle in radians
+      imuState.angle_rad, // Current angle in radians
+      imuState.rate_rad_s, // Current angular speed in radians/sec
       CONTROL_DT
     );
-//
+
+  // This is raw input, unitless (maximum of 100)
   float u_left = u;
   float u_right = u;
 
   // --- SYSTEM IDENTIFICATION INJECTION ---
-  //if (enableSysId) {
-  //  noiseCounter++;
-  //  if (noiseCounter >= noiseHoldCycles) {
-  //    // Generate independent random noise for left and right wheels
-  //    currentNoiseLeft = (random(-100, 101) / 100.0f) * noiseAmplitude;
-  //    currentNoiseRight = (random(-100, 101) / 100.0f) * noiseAmplitude;
-  //    noiseCounter = 0;
-  //  }
-  //  
-  //  // Add the decoupled excitation to the control effort
-  //  u_left += currentNoiseLeft;
-  //  u_right += currentNoiseRight;
-  //  
-  //  // Clamp to valid PWM limits independently
-  //  if (u_left > 255.0f) u_left = 255.0f;
-  //  if (u_left < -255.0f) u_left = -255.0f;
-  //  
-  //  if (u_right > 255.0f) u_right = 255.0f;
-  //  if (u_right < -255.0f) u_right = -255.0f;
-  //}
+  if (enableSysId) {
+    noiseCounter++;
+    if (noiseCounter >= noiseHoldCycles) {
+      // Generate independent random noise for left and right wheels
+      currentNoiseLeft = (random(-100, 101) / 100.0f) * noiseAmplitude;
+      currentNoiseRight = (random(-100, 101) / 100.0f) * noiseAmplitude;
+      noiseCounter = 0;
+    }
+    
+    // Add the decoupled excitation to the control effort
+    u_left += currentNoiseLeft;
+    u_right += currentNoiseRight;
 
+  }
+//
   // ========================================================
-  // 6. TELEMETRY
+  // CONTROL OUTPUTS (u)
   // ========================================================
-  float time_taken = (int32_t)(micros() - now) / 1000.0f;
-
-    // Transform into sensible units for telemetry and logging
-  PhysicalState currentState = convertToSensibleUnits(
-    filtered_angle - MECHANICAL_ZERO, // Adjusted for mechanical zero
-    filtered_rate,
-    encData.pos1,
-    encData.speed1,
-    encData.pos2,
-    encData.speed2,
-    u_left,
-    u_right // For LQR this will be modify anyways
-  );
-
-  // CONTROL: LQR
-  float stateVector[6] = {
-    currentState.angle_rad, // Adjusted for mechanical zero
-    currentState.rate_rad_s,
-    currentState.pos_left_m,
-    currentState.speed_left_m_s,
-    currentState.pos_right_m,
-    currentState.speed_right_m_s
-  };
+  //float state[6] = {
+  //  imuState.target_angle_rad - imuState.angle_rad, // Error in angle
+  //  imuState.rate_rad_s,
+  //  encoderState.pos_left_m,
+  //  encoderState.speed_left_m_s,
+  //  encoderState.pos_right_m,
+  //  encoderState.speed_right_m_s
+  //};
+  //
+  //float u_left = 0.0f;
+  //float u_right = 0.0f;
+//
   //lqrController.computeControl(
-  //  stateVector,
+  //  state,
   //  u_left,
   //  u_right
   //);
+  //int pwmLeft = fabs(u_left) > 0.001f ? (int)fabs(u_left) : 0;
+  //int pwmRight = fabs(u_right) > 0.001f ? (int)fabs(u_right) : 0;
+  // DEBUG
+  //Serial.printf("angle: %.2f, u_left: %.2f, u_right: %.2f, pwmLeft: %d, pwmRight: %d\n", imuState.angle_rad, u_left, u_right, pwmLeft, pwmRight);
+  //setMotorOutputsRaw(u_left, u_right, pwmLeft, pwmRight);
 
-  // DEBUG: PRINT THE STATE to serial USB
-   //Serial.printf(
-   //  "Angle: %.2f rad, Rate: %.2f rad/s | Left: %.2f m, %.2f m/s | Right: %.2f m, %.2f m/s | Target: %.2f | u: %.2f, %.2f | Time: %.3f ms\n",
-   //  currentState.angle_rad,
-   //  currentState.rate_rad_s,
-   //  currentState.pos_left_m,
-   //  currentState.speed_left_m_s,
-   //  currentState.pos_right_m,
-   //  currentState.speed_right_m_s,
-   //   MECHANICAL_ZERO,
-   //  u_left,
-   //  u_right,
-   //  time_taken
-   //);
+  setMotorOutputs(u_left, u_right, pwmLeft, pwmRight);
+  if (fabs(u_left) > 0.001f) {
+      telemetryPwmLeft = (u_left < 0) ? pwmLeft : -pwmLeft;
+  }
+
+  if (fabs(u_right) > 0.001f) {
+      telemetryPwmRight = (u_right < 0) ? pwmRight : -pwmRight;
+  }
+  
+  // The telemetry PWM are the ACTUAL PWM values that are sent
+  // to the H-bridge, with the sign indicating direction.
+
+  // Now we can scale them for telemetry
+  SystemInput systemInput = convertSystemInputToSensibleUnits(
+    telemetryPwmLeft,
+    telemetryPwmRight
+  );
+  // ========================================================
+  // TELEMETRY
+  // ========================================================
+  float time_taken = (int32_t)(micros() - now) / 1000.0f;
 
   TelemetryPacket currentData = {
     imuSuccess,
     raw_ax, raw_ay, raw_az,
     raw_gx, raw_gy, raw_gz,
-    currentState.angle_rad,
-    currentState.rate_rad_s,
-    currentState.pos_left_m,
-    currentState.speed_left_m_s,
-    currentState.pos_right_m,
-    currentState.speed_right_m_s,
-    MECHANICAL_ZERO, // Target angle for telemetry
-    currentState.u_left_normalized,
-    currentState.u_right_normalized,
+    imuState.angle_rad,
+    imuState.rate_rad_s,
+    encoderState.pos_left_m,
+    encoderState.speed_left_m_s,
+    encoderState.pos_right_m,
+    encoderState.speed_right_m_s,
+    imuState.target_angle_rad,
+    systemInput.u_left_normalized,
+    systemInput.u_right_normalized,
     time_taken,
     now
   };
 
   // Non-blocking. If the queue is full, skip this telemetry sample.
   xQueueSend(telemetryQueue, &currentData, 0);
-
-  // ========================================================
-  // 7. MOTORS
-  // ========================================================
-  setMotorOutputs(u, u);
 }

@@ -10,7 +10,7 @@ float PID::compute(float target, float current, float currentRate, float dt, boo
     if (dt <= 0.0f) return 0.0f; 
 
     // If the angle is beyond 25 degrees, just return 0. 
-    if (angle && abs(target - current) > 25.0f) {
+    if (angle && abs(target - current) > 0.436332f) { // 25 degrees in radians
         return 0.0f;
     }
     float error = target - current;

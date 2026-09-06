@@ -22,7 +22,7 @@ static int computeLinearizedPWM(float cmdFraction, int minPWM, float trim) {
 }
 
 // Low-level independent control: Accepts UNBOUNDED raw left/right commands
-void setMotorOutputs(float leftCmd, float rightCmd) {
+void setMotorOutputs(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM) {
   
   // Normalize the unbounded math inputs into a fraction
   // capped at 100% since it will saturate the PWM and breakdown.
@@ -31,9 +31,34 @@ void setMotorOutputs(float leftCmd, float rightCmd) {
 
   // Compute physical PWM 
   // (computeLinearizedPWM will handle clamping the 1.2 back down to 1.0 safely)
-  int leftPWM  = computeLinearizedPWM(leftFraction,  config.minPWM_Left,  config.trimLeft);
-  int rightPWM = computeLinearizedPWM(rightFraction, config.minPWM_Right, config.trimRight);
+  // Note these are NOT signed, since the direction is handled by the H-bridge pins.
+  leftPWM  = computeLinearizedPWM(leftFraction,  config.minPWM_Left,  config.trimLeft);
+  rightPWM = computeLinearizedPWM(rightFraction, config.minPWM_Right, config.trimRight);
 
+  // Actuate Left
+  if (leftCmd > 0) {
+    analogWrite(PIN_AIN1, 0);       analogWrite(PIN_AIN2, leftPWM);
+  } else if (leftCmd < 0) {
+    analogWrite(PIN_AIN1, leftPWM); analogWrite(PIN_AIN2, 0);
+  } else {
+    analogWrite(PIN_AIN1, 0);       analogWrite(PIN_AIN2, 0);
+  }
+
+  // Actuate Right
+  if (rightCmd > 0) {
+    analogWrite(PIN_BIN1, 0);       analogWrite(PIN_BIN2, rightPWM);
+  } else if (rightCmd < 0) {
+    analogWrite(PIN_BIN1, rightPWM); analogWrite(PIN_BIN2, 0);
+  } else {
+    analogWrite(PIN_BIN1, 0);       analogWrite(PIN_BIN2, 0);
+  }
+}
+
+void setMotorOutputsRaw(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM) {
+
+  // Constraint to the hardware limits
+  leftPWM  = constrain(leftPWM, 0, config.maxPWM);
+  rightPWM = constrain(rightPWM, 0, config.maxPWM);
   // Actuate Left
   if (leftCmd > 0) {
     analogWrite(PIN_AIN1, 0);       analogWrite(PIN_AIN2, leftPWM);
@@ -75,5 +100,6 @@ void setDrive(float throttle, float steering) {
     rightCmd *= scaleFactor;
   }
 
-  setMotorOutputs(leftCmd, rightCmd);
+  int leftPWM, rightPWM;
+  setMotorOutputs(leftCmd, rightCmd, leftPWM, rightPWM);
 }

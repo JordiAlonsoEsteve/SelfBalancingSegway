@@ -25,13 +25,16 @@ struct MotorConfig { // TODO CHECK THIS, right now is arbitrary!
   int maxPWM = 254;
 
   // 4. THE MATH-TO-PHYSICS BRIDGE
-  float u_max = 100.0f; 
+  float u_max = 100.0f; // This s the maximum control effort. Reducing 
+  // this number will increase the effect of the Kp, for instance, since it will 
+  // yield a higher proportion of the maximum control effort for the same error.
 };
 
 // --- Public Function Prototypes ---
 // These are the functions that your main loop or PID controller is allowed to call.
 
-void setMotorOutputs(float leftCmd, float rightCmd);
+void setMotorOutputs(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM);
+void setMotorOutputsRaw(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM);
 void setDrive(float throttle, float steering);
 
 // TIP: You should probably add a function to initialize the pins!
