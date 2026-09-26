@@ -19,13 +19,17 @@
 constexpr float TICK_IN_CM = 15/1040.0f; // 15cm per 1040 ticks
 constexpr float TICK_TO_METERS = TICK_IN_CM / 100.0f; // 0.000136 meters per tick
 constexpr float DEG_TO_RAD_FACTOR = PI / 180.0f;
-constexpr uint32_t CONTROL_PERIOD_US = 2500; // ~285Hz control loop
-constexpr float CONTROL_DT = CONTROL_PERIOD_US / 1000000.0f; 
+
+constexpr uint32_t CONTROL_PERIOD_US = 2500 * 1.5;                
+constexpr uint32_t SAMPLE_PERIOD_US  = CONTROL_PERIOD_US / 2; // 400 Hz sensing/telemetry
+constexpr float CONTROL_DT = CONTROL_PERIOD_US / 1000000.0f;  // dt for PID (control-rate)
+constexpr float SAMPLE_DT  = SAMPLE_PERIOD_US  / 1000000.0f;  // dt for Kalman (sample-rate
+
 const int bmi160_addr = 0x68;
 const int sda_pin     = 21;     // ESP32 Hardware Default SDA
 const int scl_pin     = 22;     // ESP32 Hardware Default SCL
 // Balance Loop Tunings
-const float balKp = 9.5 / DEG_TO_RAD_FACTOR;
+const float balKp = 9.7 / DEG_TO_RAD_FACTOR;
 const float balKi = 0.0;
 const float balKd = 0.45 / DEG_TO_RAD_FACTOR;
 // Position Loop Tunings
@@ -35,10 +39,6 @@ const float posKi = 0.0;
 const float posKd = (0.05 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
 // Correcting robot's balance
 const float MECHANICAL_ZERO = -1.4;
-// SYSID stuff
-const bool enableSysId = false;         // Toggle noise injection
-const float noiseAmplitude = 20.0f;    // Max noise amplitude; 100 is 100% ! 
-const int noiseHoldCycles = 15;         // Hold noise for 5 cycles (12.5ms at 400Hz)
 // ==========================================================
 // DATA STRUCTURES
 // ==========================================================
@@ -236,10 +236,15 @@ float currentNoiseRight = 0.0f;
 uint32_t nextControlTime = 0;
 String inputBuffer = "";
 unsigned long lastTime = 0;
-int32_t pwmLeft = 0;
-int32_t pwmRight = 0;
-float telemetryPwmLeft = 0.0f;
-float telemetryPwmRight = 0.0f;
+
+uint32_t nextSampleTime = 0;
+bool controlTick = false; // flips every sample; true on samples where control law runs
+
+// Held between control updates (zero-order hold), also used for telemetry in between
+float u_left = 0.0f, u_right = 0.0f;
+int32_t pwmLeft = 0, pwmRight = 0;
+float telemetryPwmLeft = 0.0f, telemetryPwmRight = 0.0f;
+
 
 
 // ==========================================================
@@ -272,6 +277,7 @@ void setup() {
   digitalWrite(PIN_STBY, HIGH);
   lastTime = micros();
   nextControlTime = lastTime + CONTROL_PERIOD_US;
+  nextSampleTime = lastTime + SAMPLE_PERIOD_US;
 
   SerialBT.begin("ESP32_Robot_BT"); // Name of your Bluetooth device
   Serial.println("Bluetooth started! Ready to pair as 'ESP32_Robot_BT'");
@@ -280,157 +286,84 @@ void setup() {
 
 void loop() {
   uint32_t now = micros();
-  // Not time for the next control iteration yet.
-  if ((int32_t)(now - nextControlTime) < 0) {
+  if ((int32_t)(now - nextSampleTime) < 0) {
     return;
   }
-  // Schedule the next iteration.
-  nextControlTime += CONTROL_PERIOD_US;
+  nextSampleTime += SAMPLE_PERIOD_US;
+
   // ========================================================
-  // IMU DATA
+  // SENSING (runs every sample, 800 Hz)
   // ========================================================
   float &raw_gx = imuData.gx_dps;
   float &raw_gy = imuData.gy_dps;
   float &raw_gz = imuData.gz_dps;
-
   float &raw_ax = imuData.ax_g;
   float &raw_ay = imuData.ay_g;
   float &raw_az = imuData.az_g;
+
+  bool imuSuccess = bmi160.readSensor(imuData);
+  EncoderData encData = getEncoderData();
 
   float filtered_angle = 0.0f;
   float filtered_rate = 0.0f;
   float _ = 0.0f;
 
-  // ========================================================
-  // READ RAW IMU + RAW ENCODERS
-  // ========================================================
-  bool imuSuccess = bmi160.readSensor(imuData);
-  EncoderData encData = getEncoderData();
-
-  // ========================================================
-  // KALMAN FILTER
-  // ========================================================
   updateKalman(
-    raw_ay,
-    raw_az,
-    raw_gx,
-    CONTROL_DT,
-    filtered_angle, 
+    raw_ay, raw_az, raw_gx,
+    SAMPLE_DT,                 
+    filtered_angle,
     filtered_rate,
     _
   );
-  // Get the proper scale for the Kalman filter output (radians)
+
   IMUstate imuState = convertIMUtoSensibleUnits(
-    filtered_angle,
-    MECHANICAL_ZERO,
-    filtered_rate);
+    filtered_angle, MECHANICAL_ZERO, filtered_rate);
 
-  // get the proper scale for the encoder output (meters)
   EncoderState encoderState = convertEncoderToSensibleUnits(
-    encData.pos1,
-    encData.speed1,
-    encData.pos2,
-    encData.speed2);
+    encData.pos1, encData.speed1,
+    encData.pos2, encData.speed2);
 
   // ========================================================
-  // POSITION PID
+  // CONTROL (runs every other sample)
   // ========================================================
-  float avg_pos =
-    (encoderState.pos_left_m + encoderState.pos_right_m) / 2.0f;
-  avg_pos = constrain(avg_pos, -5000.0f, 5000.0f);
+  controlTick = !controlTick;
 
-  float avg_speed =
-    (encoderState.speed_left_m_s + encoderState.speed_right_m_s) / 2.0f;
-  float angle_adjustment = // Modifies the angle to force a deviation to
-    // correct the position error. This is the outer loop of the cascaded PID.
-    positionPID.compute(
-      0.0f,
-      avg_pos, // RAW ticks
-      avg_speed, // RAW ticks/sec
-      CONTROL_DT, 
-      false
+  if (controlTick) {
+    float avg_pos = (encoderState.pos_left_m + encoderState.pos_right_m) / 2.0f;
+    float avg_speed = (encoderState.speed_left_m_s + encoderState.speed_right_m_s) / 2.0f;
 
-    );
-  
-  float dynamic_target_angle = imuState.target_angle_rad + angle_adjustment;
+    float angle_adjustment = positionPID.compute(
+      0.0f, avg_pos, avg_speed, CONTROL_DT, false);
 
-  // ========================================================
-  // BALANCE PID
-  // ========================================================
-  
-  float u =
-    balancePID.compute(
-      dynamic_target_angle, // Target angle in radians
-      imuState.angle_rad, // Current angle in radians
-      imuState.rate_rad_s, // Current angular speed in radians/sec
-      CONTROL_DT
-    );
+    float dynamic_target_angle = imuState.target_angle_rad + angle_adjustment;
 
-  // This is raw input, unitless (maximum of 100)
-  float u_left = u;
-  float u_right = u;
+    float u = balancePID.compute(
+      dynamic_target_angle,
+      imuState.angle_rad,
+      imuState.rate_rad_s,
+      CONTROL_DT);
 
-  // --- SYSTEM IDENTIFICATION INJECTION ---
-  if (enableSysId) {
-    noiseCounter++;
-    if (noiseCounter >= noiseHoldCycles) {
-      // Generate independent random noise for left and right wheels
-      currentNoiseLeft = (random(-100, 101) / 100.0f) * noiseAmplitude;
-      currentNoiseRight = (random(-100, 101) / 100.0f) * noiseAmplitude;
-      noiseCounter = 0;
-    }
-    
-    // Add the decoupled excitation to the control effort
-    u_left += currentNoiseLeft;
-    u_right += currentNoiseRight;
+    u_left = u;
+    u_right = u;
 
-  }
-//
-  // ========================================================
-  // CONTROL OUTPUTS (u)
-  // ========================================================
-  //float state[6] = {
-  //  imuState.target_angle_rad - imuState.angle_rad, // Error in angle
-  //  imuState.rate_rad_s,
-  //  encoderState.pos_left_m,
-  //  encoderState.speed_left_m_s,
-  //  encoderState.pos_right_m,
-  //  encoderState.speed_right_m_s
-  //};
-  //
-  //float u_left = 0.0f;
-  //float u_right = 0.0f;
-//
-  //lqrController.computeControl(
-  //  state,
-  //  u_left,
-  //  u_right
-  //);
-  //int pwmLeft = fabs(u_left) > 0.001f ? (int)fabs(u_left) : 0;
-  //int pwmRight = fabs(u_right) > 0.001f ? (int)fabs(u_right) : 0;
-  // DEBUG
-  //Serial.printf("angle: %.2f, u_left: %.2f, u_right: %.2f, pwmLeft: %d, pwmRight: %d\n", imuState.angle_rad, u_left, u_right, pwmLeft, pwmRight);
-  //setMotorOutputsRaw(u_left, u_right, pwmLeft, pwmRight);
+    setMotorOutputs(u_left, u_right, pwmLeft, pwmRight);
 
-  setMotorOutputs(u_left, u_right, pwmLeft, pwmRight);
-  if (fabs(u_left) > 0.001f) {
+    if (fabs(u_left) > 0.001f) {
       telemetryPwmLeft = (u_left < 0) ? pwmLeft : -pwmLeft;
-  }
-
-  if (fabs(u_right) > 0.001f) {
+    }
+    if (fabs(u_right) > 0.001f) {
       telemetryPwmRight = (u_right < 0) ? pwmRight : -pwmRight;
+    }
   }
-  
-  // The telemetry PWM are the ACTUAL PWM values that are sent
-  // to the H-bridge, with the sign indicating direction.
+  // else: no new control action this sample — u_left/u_right/pwm*/telemetryPwm*
+  // stay at their last-computed (held) values, matching what the H-bridge is
+  // physically doing between control updates.
 
-  // Now we can scale them for telemetry
   SystemInput systemInput = convertSystemInputToSensibleUnits(
-    telemetryPwmLeft,
-    telemetryPwmRight
-  );
+    telemetryPwmLeft, telemetryPwmRight);
+
   // ========================================================
-  // TELEMETRY
+  // TELEMETRY (runs every sample)
   // ========================================================
   float time_taken = (int32_t)(micros() - now) / 1000.0f;
 
@@ -448,9 +381,8 @@ void loop() {
     systemInput.u_left_normalized,
     systemInput.u_right_normalized,
     time_taken,
-    now
+    micros() // current_time
+    
   };
-
-  // Non-blocking. If the queue is full, skip this telemetry sample.
   xQueueSend(telemetryQueue, &currentData, 0);
 }

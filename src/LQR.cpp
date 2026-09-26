@@ -15,7 +15,7 @@ void LQR::computeControl(float state[6], float &u_left, float &u_right) {
         u_left  -= K[0][i] * state[i];
         u_right -= K[1][i] * state[i];
         }
-        u_left *= 15; // scale to PWM range
-        u_right *= 15; // scale to PWM range
+        u_left *= 100; // scale to PWM range
+        u_right *= 100; // scale to PWM range
     }
 }
