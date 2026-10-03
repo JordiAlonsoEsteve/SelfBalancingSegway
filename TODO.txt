@@ -1,6 +1,0 @@
-[ ] Clean main.cpp
-    [ ] Solve the issue with normalization of inputs
-[ ] Check that the masurements of the encoder are kind of okay in terms of meters
-
-
-[ ] Make the PID work on the proper coordinates

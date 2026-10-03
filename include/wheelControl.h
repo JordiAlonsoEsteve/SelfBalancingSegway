@@ -12,7 +12,7 @@
 #define PIN_BIN2 25
 
 // --- Configuration Struct ---
-struct MotorConfig { // TODO CHECK THIS, right now is arbitrary!
+struct MotorConfig {
   // 1. DEADZONE AVOIDANCE (Overcoming Static Friction)
   int minPWM_Left = 35;  
   int minPWM_Right = 35;
@@ -36,6 +36,3 @@ struct MotorConfig { // TODO CHECK THIS, right now is arbitrary!
 void setMotorOutputs(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM);
 void setMotorOutputsRaw(float leftCmd, float rightCmd, int &leftPWM, int &rightPWM);
 void setDrive(float throttle, float steering);
-
-// TIP: You should probably add a function to initialize the pins!
-// void initWheelControl();

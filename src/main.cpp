@@ -6,7 +6,6 @@
 #include "bmi160_driver.h"
 #include "encoder_driver.h"
 #include "PID.h"
-#include "LQR.h"
 // Check if Bluetooth is enabled in the ESP32 core
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
@@ -21,24 +20,24 @@ constexpr float TICK_TO_METERS = TICK_IN_CM / 100.0f; // 0.000136 meters per tic
 constexpr float DEG_TO_RAD_FACTOR = PI / 180.0f;
 
 constexpr uint32_t CONTROL_PERIOD_US = 2500 * 1.5;                
-constexpr uint32_t SAMPLE_PERIOD_US  = CONTROL_PERIOD_US / 2; // 400 Hz sensing/telemetry
 constexpr float CONTROL_DT = CONTROL_PERIOD_US / 1000000.0f;  // dt for PID (control-rate)
-constexpr float SAMPLE_DT  = SAMPLE_PERIOD_US  / 1000000.0f;  // dt for Kalman (sample-rate
+constexpr float SAMPLE_DT  = CONTROL_PERIOD_US / 1000000.0f;  // dt for Kalman (sample-rate)
 
 const int bmi160_addr = 0x68;
 const int sda_pin     = 21;     // ESP32 Hardware Default SDA
 const int scl_pin     = 22;     // ESP32 Hardware Default SCL
 // Balance Loop Tunings
-const float balKp = 9.7 / DEG_TO_RAD_FACTOR;
-const float balKi = 0.0;
-const float balKd = 0.45 / DEG_TO_RAD_FACTOR;
+const float balKp = 9.75 / DEG_TO_RAD_FACTOR;
+const float balKi = 0.0 / DEG_TO_RAD_FACTOR;
+const float balKd = 0.55 / DEG_TO_RAD_FACTOR;
 // Position Loop Tunings
 // Position Loop Tunings (Outputs radians instead of degrees)
-const float posKp = (0.0001 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
+const float posKp = (0.0015 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
 const float posKi = 0.0;
-const float posKd = (0.05 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
+const float posKd = (0.065 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
 // Correcting robot's balance
 const float MECHANICAL_ZERO = -1.4;
+
 // ==========================================================
 // DATA STRUCTURES
 // ==========================================================
@@ -107,7 +106,6 @@ PID balancePID(balKp, balKi, balKd, -255.0, 255.0);
 PID positionPID(posKp, posKi, posKd, -3.0 * DEG_TO_RAD_FACTOR, 3.0 * DEG_TO_RAD_FACTOR);// FreeRTOS Queue Handle
 QueueHandle_t telemetryQueue;
 BluetoothSerial SerialBT;
-LQR lqrController;
 
 
 // ==========================================================
@@ -277,7 +275,6 @@ void setup() {
   digitalWrite(PIN_STBY, HIGH);
   lastTime = micros();
   nextControlTime = lastTime + CONTROL_PERIOD_US;
-  nextSampleTime = lastTime + SAMPLE_PERIOD_US;
 
   SerialBT.begin("ESP32_Robot_BT"); // Name of your Bluetooth device
   Serial.println("Bluetooth started! Ready to pair as 'ESP32_Robot_BT'");
@@ -286,13 +283,13 @@ void setup() {
 
 void loop() {
   uint32_t now = micros();
-  if ((int32_t)(now - nextSampleTime) < 0) {
+  if ((int32_t)(now - nextControlTime) < 0) {
     return;
   }
-  nextSampleTime += SAMPLE_PERIOD_US;
+  nextControlTime += CONTROL_PERIOD_US;
 
   // ========================================================
-  // SENSING (runs every sample, 800 Hz)
+  // SENSING
   // ========================================================
   float &raw_gx = imuData.gx_dps;
   float &raw_gy = imuData.gy_dps;
@@ -323,37 +320,31 @@ void loop() {
     encData.pos1, encData.speed1,
     encData.pos2, encData.speed2);
 
-  // ========================================================
-  // CONTROL (runs every other sample)
-  // ========================================================
-  controlTick = !controlTick;
+ 
+  float avg_pos = (encoderState.pos_left_m + encoderState.pos_right_m) / 2.0f;
+  float avg_speed = (encoderState.speed_left_m_s + encoderState.speed_right_m_s) / 2.0f;
 
-  if (controlTick) {
-    float avg_pos = (encoderState.pos_left_m + encoderState.pos_right_m) / 2.0f;
-    float avg_speed = (encoderState.speed_left_m_s + encoderState.speed_right_m_s) / 2.0f;
+  float angle_adjustment = positionPID.compute(
+    0.0f, avg_pos, avg_speed, CONTROL_DT, false);
 
-    float angle_adjustment = positionPID.compute(
-      0.0f, avg_pos, avg_speed, CONTROL_DT, false);
+  float dynamic_target_angle = imuState.target_angle_rad + angle_adjustment;
 
-    float dynamic_target_angle = imuState.target_angle_rad + angle_adjustment;
+  float u = balancePID.compute(
+    dynamic_target_angle,
+    imuState.angle_rad,
+    imuState.rate_rad_s,
+    CONTROL_DT);
 
-    float u = balancePID.compute(
-      dynamic_target_angle,
-      imuState.angle_rad,
-      imuState.rate_rad_s,
-      CONTROL_DT);
+  u_left = u;
+  u_right = u;
 
-    u_left = u;
-    u_right = u;
+  setMotorOutputs(u_left, u_right, pwmLeft, pwmRight);
 
-    setMotorOutputs(u_left, u_right, pwmLeft, pwmRight);
-
-    if (fabs(u_left) > 0.001f) {
-      telemetryPwmLeft = (u_left < 0) ? pwmLeft : -pwmLeft;
-    }
-    if (fabs(u_right) > 0.001f) {
-      telemetryPwmRight = (u_right < 0) ? pwmRight : -pwmRight;
-    }
+  if (fabs(u_left) > 0.001f) {
+    telemetryPwmLeft = (u_left < 0) ? pwmLeft : -pwmLeft;
+  }
+  if (fabs(u_right) > 0.001f) {
+    telemetryPwmRight = (u_right < 0) ? pwmRight : -pwmRight;
   }
   // else: no new control action this sample — u_left/u_right/pwm*/telemetryPwm*
   // stay at their last-computed (held) values, matching what the H-bridge is
@@ -377,7 +368,7 @@ void loop() {
     encoderState.speed_left_m_s,
     encoderState.pos_right_m,
     encoderState.speed_right_m_s,
-    imuState.target_angle_rad,
+    dynamic_target_angle,
     systemInput.u_left_normalized,
     systemInput.u_right_normalized,
     time_taken,
