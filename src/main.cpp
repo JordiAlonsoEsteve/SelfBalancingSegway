@@ -27,14 +27,14 @@ const int bmi160_addr = 0x68;
 const int sda_pin     = 21;     // ESP32 Hardware Default SDA
 const int scl_pin     = 22;     // ESP32 Hardware Default SCL
 // Balance Loop Tunings
-const float balKp = 9.75 / DEG_TO_RAD_FACTOR;
+const float balKp = 9.8 / DEG_TO_RAD_FACTOR;
 const float balKi = 0.0 / DEG_TO_RAD_FACTOR;
 const float balKd = 0.55 / DEG_TO_RAD_FACTOR;
 // Position Loop Tunings
 // Position Loop Tunings (Outputs radians instead of degrees)
 const float posKp = (0.0015 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
 const float posKi = 0.0;
-const float posKd = (0.065 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
+const float posKd = (0.075 * DEG_TO_RAD_FACTOR) / TICK_TO_METERS;
 // Correcting robot's balance
 const float MECHANICAL_ZERO = -1.4;
 
@@ -103,7 +103,7 @@ struct __attribute__((packed)) SystemIdWirePacket {
 // ==========================================================
 BMI160Driver bmi160(bmi160_addr);
 PID balancePID(balKp, balKi, balKd, -255.0, 255.0);
-PID positionPID(posKp, posKi, posKd, -3.0 * DEG_TO_RAD_FACTOR, 3.0 * DEG_TO_RAD_FACTOR);// FreeRTOS Queue Handle
+PID positionPID(posKp, posKi, posKd, -3.5 * DEG_TO_RAD_FACTOR, 3.5 * DEG_TO_RAD_FACTOR);// FreeRTOS Queue Handle
 QueueHandle_t telemetryQueue;
 BluetoothSerial SerialBT;
 
